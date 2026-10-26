@@ -205,6 +205,7 @@ but never
 .Va denyReadAlways .
 Protected roots and descendants stay denied across moves, hard links,
 canonical symlink aliases, and broker approval.
+Denied roots and descendants also cannot be removed.
 Linux/macOS enforce concrete and glob read/write denials at access time;
 Windows enforces only concrete non-root paths existing at startup and rejects
 nonempty

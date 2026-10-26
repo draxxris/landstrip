@@ -319,6 +319,13 @@ impl ProfileBuilder {
                 let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
                 writeln!(self.sb, "(deny file-write-unlink {filter}{message})")?;
             }
+            for link in policy.write_denied_links.iter() {
+                let escaped = escape_sbpl_literal(&link.path.to_string_lossy());
+                writeln!(
+                    self.sb,
+                    "(deny file-write-unlink (literal \"{escaped}\"){message})"
+                )?;
+            }
 
             let mut ancestors: Vec<PathBuf> = Vec::new();
             // Ancestors that are themselves granted write roots must not

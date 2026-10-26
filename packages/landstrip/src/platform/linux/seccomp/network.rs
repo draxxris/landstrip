@@ -470,10 +470,7 @@ fn handle_unix_bind(
         &target.label,
         anchor.target.as_ref().map(AsFd::as_fd),
     )?;
-    if policy
-        .write_reason(&target.label, &target.lexical, true)
-        .is_some()
-    {
+    if policy.write_reason(&target.label, true).is_some() {
         return Err(BrokerError::PolicyDenied);
     }
     let broker_path = anchor.path()?;

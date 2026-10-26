@@ -80,8 +80,6 @@ pub(crate) enum Error {
     PolicyUnixSocketUnsupported,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     PolicyUnixSocketPath,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    PolicyDenyWriteSymlinkAncestor,
     PolicyInvalidPort,
     PolicyEmptyPath,
     PolicyInvalidMachLookup,
@@ -195,9 +193,6 @@ impl Error {
             }
             Self::PolicyUnixSocketPath => {
                 Some("an allowed Unix socket path exists but is not a socket")
-            }
-            Self::PolicyDenyWriteSymlinkAncestor => {
-                Some("a denied write symlink ancestor is reachable through an allowed write root")
             }
             Self::PolicyInvalidPort => Some("proxy ports must be between 1 and 65535"),
             Self::PolicyEmptyPath => Some("policy paths must not be empty"),

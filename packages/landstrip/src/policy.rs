@@ -40,7 +40,7 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_denied_always_roots: Box<[PathBuf]>,
     pub(crate) write_denied_always_patterns: Box<[String]>,
     pub(crate) write_denied_patterns: Vec<String>,
-    pub(crate) write_denied_links: Vec<PathBuf>,
+    pub(crate) write_denied_links: DeniedLinks,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
     pub(crate) read_denied_patterns: Vec<String>,
@@ -58,6 +58,74 @@ pub(crate) struct AccessPolicy {
     pub(crate) allow_windows_loopback: bool,
 }
 
+/// How strongly a denied link is protected: `always` links cannot be removed
+/// even by broker approval.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DenialTier {
+    Queryable,
+    Always,
+}
+
+/// A symlink leading into a denied write subtree. Its own path is protected
+/// from unlink and rename, otherwise the subtree could be re-pointed after the
+/// sandbox started.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeniedLink {
+    pub(crate) path: PathBuf,
+    pub(crate) tier: DenialTier,
+}
+
+impl DeniedLink {
+    fn new(path: PathBuf, tier: DenialTier) -> Self {
+        Self { path, tier }
+    }
+}
+
+/// Every protected link, sorted by path and collapsed to the strongest tier.
+/// The ordering is an invariant of the type, so membership is a binary search.
+#[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct DeniedLinks(Vec<DeniedLink>);
+
+impl DeniedLinks {
+    fn new(mut links: Vec<DeniedLink>) -> Self {
+        links.sort_by(|left, right| {
+            let strength = |link: &DeniedLink| u8::from(link.tier == DenialTier::Always);
+            left.path
+                .cmp(&right.path)
+                .then_with(|| strength(right).cmp(&strength(left)))
+        });
+        links.dedup_by(|left, right| left.path == right.path);
+        Self(links)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &DeniedLink> {
+        self.0.iter()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn find(&self, path: &Path) -> Option<&DeniedLink> {
+        self.0
+            .binary_search_by(|link| link.path.as_path().cmp(path))
+            .ok()
+            .map(|index| &self.0[index])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn contains(&self, path: &Path) -> bool {
+        self.find(path).is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn contains_always(&self, path: &Path) -> bool {
+        self.find(path)
+            .is_some_and(|link| link.tier == DenialTier::Always)
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,20 +137,25 @@ pub(crate) enum DenialReason {
 // The write broker that consults these lives only in the Linux seccomp path.
 #[cfg(target_os = "linux")]
 impl AccessPolicy {
-    /// Whether a write to `canonical` (with lexical form `lexical`, used for the
-    /// symlink-ancestor deny-list) lands in the `denyWrite` deny-list. Glob
-    /// patterns in `write_denied_patterns` are evaluated dynamically against the
-    /// lexical path so files created after sandbox startup are also blocked.
-    pub(crate) fn is_write_denied(&self, canonical: &Path, lexical: &Path) -> bool {
+    /// Whether a write to `canonical` lands in the `denyWrite` deny-list. Glob
+    /// patterns in `write_denied_patterns` are evaluated dynamically so files
+    /// created after sandbox startup are also blocked.
+    pub(crate) fn is_write_denied(&self, canonical: &Path) -> bool {
         matches_denied(
             &self.write_denied_roots,
             &self.write_denied_patterns,
             canonical,
-        ) || matches_denied(
-            &self.write_denied_links,
-            &self.write_denied_patterns,
-            lexical,
         )
+    }
+
+    /// A denied subtree is only as strong as the symlinks leading into it:
+    /// unlinking or renaming a link would re-point the denied path.
+    pub(crate) fn is_denied_link(&self, path: &Path) -> bool {
+        self.write_denied_links.contains(path)
+    }
+
+    pub(crate) fn is_denied_link_always(&self, path: &Path) -> bool {
+        self.write_denied_links.contains_always(path)
     }
 
     pub(crate) fn is_write_denied_always(&self, canonical: &Path, lexical: &Path) -> bool {
@@ -150,10 +223,9 @@ impl AccessPolicy {
     pub(crate) fn write_reason(
         &self,
         canonical: &Path,
-        lexical: &Path,
         surface_allow_miss: bool,
     ) -> Option<DenialReason> {
-        if self.is_write_denied(canonical, lexical) {
+        if self.is_write_denied(canonical) {
             Some(DenialReason::DenyMatch)
         } else if surface_allow_miss && !canonical.is_under_any(&self.write_roots) {
             Some(DenialReason::AllowMiss)
@@ -181,7 +253,7 @@ impl AccessPolicy {
 #[cfg(target_os = "macos")]
 impl AccessPolicy {
     /// Reject policies macOS Seatbelt cannot enforce: an existing non-socket
-    /// `allowUnixSockets` path or a `denyWrite` symlink ancestor.
+    /// `allowUnixSockets` path.
     pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
         if let UnixSocketAccess::AllowPaths(paths) = self.network_access.unix_socket_access() {
             for path in paths {
@@ -196,14 +268,6 @@ impl AccessPolicy {
                     _ => return Err(Error::PolicyUnixSocketPath),
                 }
             }
-        }
-
-        let has_writable_symlink_ancestor = self
-            .write_denied_links
-            .iter()
-            .any(|link| link.is_under_any(&self.write_roots));
-        if has_writable_symlink_ancestor {
-            return Err(Error::PolicyDenyWriteSymlinkAncestor);
         }
 
         Ok(())
@@ -367,28 +431,35 @@ impl Settings {
         // fail-closed because sandbox SIDs receive no access to those paths.
         #[cfg(target_os = "windows")]
         retain_windows_allow_roots(&mut write_allow);
+        let write_deny_selectors =
+            PolicyResolver::anchor_write_deny_selectors(&filesystem.deny_write, &write_allow);
+        let write_always_selectors = PolicyResolver::anchor_write_deny_selectors(
+            &filesystem.deny_write_always,
+            &write_allow,
+        );
         // Linux mediates denyWrite globs dynamically; expanding them here can scan
         // an entire project before even starting a simple command.
-        let mut resolved_write_deny = resolver.resolve_write_deny_paths(
-            &filesystem.deny_write,
-            &write_allow,
-            !cfg!(target_os = "linux"),
-        )?;
-        let mut write_denied_links = resolver.collect_symlink_ancestors(&filesystem.deny_write)?;
-        let resolved_write_always =
-            resolver.resolve_write_deny_paths(&filesystem.deny_write_always, &write_allow, true)?;
-        let write_always_links =
-            resolver.collect_symlink_ancestors(&filesystem.deny_write_always)?;
+        let mut resolved_write_deny =
+            resolver.resolve_deny_paths(&write_deny_selectors, !cfg!(target_os = "linux"))?;
+        let resolved_write_always = resolver.resolve_deny_paths(&write_always_selectors, true)?;
+        let mut denied_links: Vec<DeniedLink> = resolver
+            .collect_symlink_ancestors(&write_deny_selectors)?
+            .into_iter()
+            .map(|path| DeniedLink::new(path, DenialTier::Queryable))
+            .collect();
+        denied_links.extend(
+            resolver
+                .collect_symlink_ancestors(&write_always_selectors)?
+                .into_iter()
+                .map(|path| DeniedLink::new(path, DenialTier::Always)),
+        );
+        let write_denied_links = DeniedLinks::new(denied_links);
         resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
         let write_deny = resolved_write_deny.concrete;
         let write_denied_patterns = resolved_write_deny.patterns;
         let mut write_denied_always_roots = resolved_write_always.concrete;
-        write_denied_always_roots.extend(write_always_links.iter().cloned());
         write_denied_always_roots.normalize_roots();
         let write_denied_always_patterns = resolved_write_always.patterns;
-        write_denied_links.extend(write_always_links);
-        write_denied_links.sort_unstable();
-        write_denied_links.dedup();
 
         let mut read_allow = resolver.resolve_paths(&filesystem.allow_read)?;
         #[cfg(target_os = "windows")]
@@ -732,12 +803,12 @@ impl PolicyResolver {
         Ok(resolved)
     }
 
-    fn resolve_write_deny_paths(
-        &self,
+    /// Anchor base-relative write-deny selectors at every granted write root, so
+    /// `denyWrite: [".git"]` protects each root rather than only the policy base.
+    fn anchor_write_deny_selectors(
         paths: &[PathSelector],
         write_allow: &[PathBuf],
-        expand_globs: bool,
-    ) -> Result<ResolvedDenyPaths> {
+    ) -> Vec<PathSelector> {
         let mut anchored = Vec::with_capacity(paths.len() * (1 + write_allow.len()));
         for selector in paths {
             anchored.push(selector.clone());
@@ -776,7 +847,7 @@ impl PolicyResolver {
                 }
             }
         }
-        self.resolve_deny_paths(&anchored, expand_globs)
+        anchored
     }
 
     fn resolve_deny_paths(
@@ -835,7 +906,7 @@ impl PolicyResolver {
                 current.push(component);
                 match fs::symlink_metadata(&current) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        links.push(normalize_path_lexically(&current));
+                        links.extend(Self::link_spellings(&current));
                     }
                     _ => {}
                 }
@@ -844,6 +915,23 @@ impl PolicyResolver {
         links.sort_unstable();
         links.dedup();
         Ok(links)
+    }
+
+    /// Spellings of a symlink's own path. Backends match kernel-canonical
+    /// paths, so a link below another symlink (macOS `/var`) needs both forms.
+    /// Canonicalizing the parent keeps the link itself unresolved.
+    fn link_spellings(link: &Path) -> impl Iterator<Item = PathBuf> {
+        let lexical = normalize_path_lexically(link);
+        let canonical = match (lexical.parent(), lexical.file_name()) {
+            (Some(parent), Some(name)) => fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name)),
+            _ => None,
+        };
+        canonical
+            .filter(|canonical| *canonical != lexical)
+            .into_iter()
+            .chain(std::iter::once(lexical))
     }
 
     fn lower_network_policy(&self, network: &SandboxNetwork) -> Result<NetworkAccess> {

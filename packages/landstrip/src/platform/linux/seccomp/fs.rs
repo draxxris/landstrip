@@ -738,7 +738,7 @@ pub(super) fn handle_access(
         process: access.process.context(),
     };
 
-    if writes && let Some(reason) = policy.write_reason(&target.label, &target.lexical, true) {
+    if writes && let Some(reason) = policy.write_reason(&target.label, true) {
         return denial(TrapOperation::Write, reason).deny(denials, allow_query);
     }
     if reads
@@ -796,7 +796,7 @@ pub(super) fn handle_openat(
 
     if wants_write
         && !hard_read_denied
-        && let Some(reason) = policy.write_reason(&resolved, &lexical, !anonymous)
+        && let Some(reason) = policy.write_reason(&resolved, !anonymous)
     {
         return OpenDenial {
             operation: TrapOperation::Write,
@@ -845,11 +845,53 @@ pub(super) fn handle_openat(
     )?))
 }
 
-fn reparent_read_denial(
+/// A policy denial anchored at one of a mutation's resolved paths.
+#[derive(Clone, Copy)]
+struct DenialAt {
+    index: usize,
+    reason: DenialReason,
+    operation: TrapOperation,
+}
+
+impl DenialAt {
+    fn read(index: usize, reason: DenialReason) -> Self {
+        Self {
+            index,
+            reason,
+            operation: TrapOperation::Read,
+        }
+    }
+
+    fn write(index: usize, reason: DenialReason) -> Self {
+        Self {
+            index,
+            reason,
+            operation: TrapOperation::Write,
+        }
+    }
+}
+
+/// Denials that outlive a name change. Seatbelt subtracts every denied read
+/// root from writes with `file-write-unlink`, so removing a denied path or
+/// giving it another name cannot escape the read policy here either. A protected
+/// link cannot be removed or renamed for the same reason: it leads to the
+/// denied subtree and re-pointing it would invalidate the deny roots.
+fn name_change_denial(
     policy: &AccessPolicy,
     spec: &Syscall,
     paths: &[(ResolvedPath, PathBuf)],
-) -> Option<(usize, DenialReason, TrapOperation)> {
+) -> Option<DenialAt> {
+    if spec.kind.is_removal() || spec.kind.is_reparent() {
+        let (source, _) = paths.first()?;
+        if policy.is_denied_link(&source.lexical) {
+            return Some(DenialAt::write(0, DenialReason::DenyMatch));
+        }
+    }
+    if spec.kind.is_removal() {
+        let (source, _) = paths.first()?;
+        let denied = policy.is_read_denied(&source.label) || policy.is_read_denied(&source.lexical);
+        return denied.then(|| DenialAt::read(0, DenialReason::DenyMatch));
+    }
     if !spec.kind.is_reparent() {
         return None;
     }
@@ -866,14 +908,14 @@ fn reparent_read_denial(
             .get(1)
             .is_none_or(|(dest, _)| policy.read_reason(&dest.label).is_none());
         if dest_readable {
-            return Some((0, reason, TrapOperation::Read));
+            return Some(DenialAt::read(0, reason));
         }
     }
     if let Some((dest, _)) = paths.get(1)
         && let Some(reason) = read_denial(dest)
         && policy.read_reason(&source.label).is_none()
     {
-        return Some((1, reason, TrapOperation::Read));
+        return Some(DenialAt::read(1, reason));
     }
     None
 }
@@ -971,22 +1013,20 @@ pub(super) fn handle_mutation(
         });
     }
 
-    let mut denial = None;
+    let mut denial: Option<DenialAt> = None;
     for (index, (target, _)) in paths.iter().enumerate() {
         // The broker executes every granted mutation outside Landlock, so
         // allowWrite misses must be enforced here.
-        if let Some(reason) = policy.write_reason(&target.label, &target.lexical, true) {
-            denial = Some((index, reason, TrapOperation::Write));
+        if let Some(reason) = policy.write_reason(&target.label, true) {
+            denial = Some(DenialAt::write(index, reason));
             break;
         }
         if spec.kind.is_reparent() && policy.has_write_denied_under(&target.label) {
-            denial = Some((index, DenialReason::DenyMatch, TrapOperation::Write));
+            denial = Some(DenialAt::write(index, DenialReason::DenyMatch));
             break;
         }
     }
-    let hard_read_denial = spec
-        .kind
-        .is_reparent()
+    let hard_read_denial = (spec.kind.is_reparent() || spec.kind.is_removal())
         .then(|| {
             paths.iter().position(|(target, _)| {
                 policy.is_read_denied_always(&target.label)
@@ -999,24 +1039,31 @@ pub(super) fn handle_mutation(
         policy.is_write_denied_always(&target.label, &target.lexical)
             || (spec.kind.is_reparent() && policy.has_write_denied_always_under(&target.label))
     });
-    let allow_query = hard_read_denial.is_none() && hard_write_denial.is_none();
-    denial = hard_read_denial
-        .map(|index| (index, DenialReason::DenyMatch, TrapOperation::Read))
-        .or_else(|| {
-            hard_write_denial.map(|index| (index, DenialReason::DenyMatch, TrapOperation::Write))
+    let hard_link_denial = (spec.kind.is_removal() || spec.kind.is_reparent())
+        .then(|| {
+            paths
+                .first()
+                .filter(|(source, _)| policy.is_denied_link_always(&source.lexical))
         })
+        .flatten();
+    let allow_query =
+        hard_read_denial.is_none() && hard_write_denial.is_none() && hard_link_denial.is_none();
+    denial = hard_read_denial
+        .map(|index| DenialAt::read(index, DenialReason::DenyMatch))
+        .or_else(|| hard_write_denial.map(|index| DenialAt::write(index, DenialReason::DenyMatch)))
+        .or_else(|| hard_link_denial.map(|_| DenialAt::write(0, DenialReason::DenyMatch)))
         .or(denial)
-        .or_else(|| reparent_read_denial(policy, spec, &paths));
+        .or_else(|| name_change_denial(policy, spec, &paths));
 
-    let denial = denial.map(|(index, reason, operation)| {
-        let (target, path) = &paths[index];
+    let denial = denial.map(|denial| {
+        let (target, path) = &paths[denial.index];
         Denial::Filesystem(FilesystemDenial {
-            operation,
+            operation: denial.operation,
             path: target.label.clone(),
             requested_path: path.clone(),
             syscall: spec.kind.into(),
             flags: Vec::new(),
-            reason,
+            reason: denial.reason,
             process: process.context(),
         })
     });
@@ -1074,7 +1121,7 @@ fn handle_fd_mutation(
     let resolved = requested_path.clone();
     let lexical = normalize_path_lexically(&requested_path);
     let hard_write_denied = policy.is_write_denied_always(&resolved, &lexical);
-    let reason = policy.write_reason(&resolved, &lexical, true);
+    let reason = policy.write_reason(&resolved, true);
     let operation = MutationGrant::Fd { target, mutation };
 
     let Some(reason) = reason else {

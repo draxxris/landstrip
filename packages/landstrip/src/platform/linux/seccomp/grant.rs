@@ -285,7 +285,7 @@ impl OpenGrant {
         }
         if self.flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0
             && (policy.is_write_denied_always(label, label)
-                || (moved && policy.write_reason(label, label, true).is_some()))
+                || (moved && policy.write_reason(label, true).is_some()))
         {
             return Err(BrokerError::syscall(libc::EACCES));
         }
