@@ -117,6 +117,14 @@ rust_host_triple="$("$RUSTC" --print host-tuple)"
 
 package_target_root="${CARGO_TARGET_DIR:-$repo_root/packages/landstrip/target/package}"
 
+# Release outputs produced on another host (e.g. ad-hoc signed Mach-O binaries
+# exported from macOS) are staged as-is instead of being rebuilt here.
+prebuilt_root="${PREBUILT_ROOT:-}"
+if [[ -n "$prebuilt_root" ]]; then
+  prebuilt_root="$(cd "$prebuilt_root" 2>/dev/null && pwd)" \
+    || die "PREBUILT_ROOT is not a directory: $PREBUILT_ROOT"
+fi
+
 # platform|rust-triple|binary-name
 platforms=(
   'linux-x64|x86_64-unknown-linux-gnu|landstrip'
@@ -169,6 +177,34 @@ smoke_host_binary() {
       "$bin" --version >/dev/null
     fi
   fi
+}
+
+stage_prebuilt() {
+  local platform="$1" binary="$2" stage_package_dir="$3"
+  local artifact="landstrip-$version-$platform.tar.gz"
+  local source_binary="$prebuilt_root/npm/$platform/bin/$binary"
+  local source_artifact="$prebuilt_root/artifacts/$artifact"
+  local digest name
+
+  [[ -n "$prebuilt_root" && "$platform" != linux-* ]] || return 1
+  [[ -f "$source_binary" && -f "$source_artifact" ]] || return 1
+  [[ -f "$source_artifact.sha256" && -f "$source_artifact.commit" ]] \
+    || die "prebuilt $platform artifact is missing its receipts"
+  read -r digest name <"$source_artifact.sha256" \
+    || die "prebuilt $platform receipt is unreadable"
+  [[ "$name" == "$artifact" ]] \
+    || die "prebuilt $platform receipt names $name instead of $artifact"
+  [[ "$(sha256_digest "$source_artifact")" == "$digest" ]] \
+    || die "prebuilt $platform artifact does not match its receipt"
+  [[ "$(<"$source_artifact.commit")" == "$head_commit" ]] \
+    || die "prebuilt $platform artifact was built from another commit"
+
+  mkdir -p "$stage_package_dir/bin"
+  cp "$source_binary" "$stage_package_dir/bin/$binary"
+  chmod 755 "$stage_package_dir/bin/$binary"
+  cp "$source_artifact" "$source_artifact.sha256" "$source_artifact.commit" \
+    "$stage_root/artifacts/"
+  printf '==> %s (prebuilt)\n' "$platform"
 }
 
 rustup_has_target() {
@@ -283,6 +319,11 @@ for platform in "${requested[@]}"; do
   package_dir="npm/$platform"
   stage_package_dir="$stage_root/$package_dir"
   [[ -f "$package_dir/package.json" ]] || die "missing $package_dir/package.json"
+
+  if stage_prebuilt "$platform" "$binary" "$stage_package_dir"; then
+    built+=("$platform")
+    continue
+  fi
 
   # Compare Rust triples because Node's platform omits the libc/toolchain ABI
   if [[ "$(package_build_driver "$rust_host_triple" "$triple")" == cargo ]]; then
