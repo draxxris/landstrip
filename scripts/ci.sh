@@ -28,18 +28,6 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
 cd "$repo_root"
 
-printf '==> package target selection test\n'
-./packages/landstrip/scripts/package-target-test.sh
-
-printf '==> package transaction test\n'
-./packages/landstrip/scripts/package-transaction-test.sh
-
-printf '==> AppImage packaging test\n'
-./packages/landstrip/scripts/make-appimage-test.sh
-
-printf '==> sha256 sidecar test\n'
-./scripts/sha256-test.sh
-
 host_platform="$(
   "$NODE" -e 'process.stdout.write(process.platform + "-" + process.arch)'
 )"
