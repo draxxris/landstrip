@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-const FILTERS_PER_RESTRICTED_ACCOUNT: usize = 8;
+const FILTERS_PER_RESTRICTED_ACCOUNT: usize = 6;
 const INSTALL_DIRECTORY: &str = "Landstrip";
 const RUNNER_FILE: &str = "landstrip-restricted-user-runner.exe";
 const MANAGEMENT_MUTEX: &str = "Global\\LandstripRestrictedUserManagement";

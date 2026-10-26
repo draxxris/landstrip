@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Persistent Windows Filtering Platform rules for restricted sandbox accounts.
+//! Windows Filtering Platform rules for restricted sandbox accounts.
+//!
+//! The installation owns persistent per-account blocks. Loopback permits for
+//! the ports a policy declares are added to a private engine session for the
+//! duration of a single run and disappear when that session closes.
 
 use super::state::{Account, Installation, NetworkMode};
 use super::{OwnedSecurityDescriptor, ToWideNul};
@@ -32,6 +36,16 @@ use windows_sys::core::GUID;
 const IPPROTO_TCP: u8 = 6;
 const FILTER_WEIGHT_BLOCK: u8 = 0;
 const FILTER_WEIGHT_PERMIT: u8 = 15;
+const CONNECT_LAYERS: [(GUID, AddressFamily); 2] = [
+    (FWPM_LAYER_ALE_AUTH_CONNECT_V4, AddressFamily::V4),
+    (FWPM_LAYER_ALE_AUTH_CONNECT_V6, AddressFamily::V6),
+];
+const INBOUND_LAYERS: [GUID; 4] = [
+    FWPM_LAYER_ALE_AUTH_LISTEN_V4,
+    FWPM_LAYER_ALE_AUTH_LISTEN_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+];
 const NOT_FOUND_STATUSES: [u32; 2] = [
     FWP_E_FILTER_NOT_FOUND.cast_unsigned(),
     FWP_E_NOT_FOUND.cast_unsigned(),
@@ -52,14 +66,7 @@ pub(super) fn install(installation: &Installation) -> Result<()> {
         .iter()
         .filter(|account| account.network_mode == NetworkMode::Restricted)
     {
-        add_account_filters(
-            engine.handle,
-            installation,
-            account,
-            provider,
-            sublayer,
-            &mut keys,
-        )?;
+        add_account_filters(engine.handle, account, provider, sublayer, &mut keys)?;
     }
     if keys.next().is_some() {
         bail!("restricted-user state has surplus WFP filter keys");
@@ -99,44 +106,72 @@ pub(super) fn uninstall(installation: &Installation) -> Result<()> {
     Ok(())
 }
 
+/// Loopback permits for the ports one run may reach.
+///
+/// The filters belong to a private engine session, so they vanish when the
+/// guard is dropped even if the process terminates abnormally.
+pub(super) struct RunPermits {
+    _engine: Engine,
+}
+
+impl RunPermits {
+    pub(super) fn add(
+        installation: &Installation,
+        account_sid: &str,
+        ports: &[u16],
+    ) -> Result<Option<Self>> {
+        if ports.is_empty() {
+            return Ok(None);
+        }
+        let engine = Engine::open()?;
+        let provider = parse_key(&installation.wfp_provider)?;
+        let sublayer = parse_key(&installation.wfp_sublayer)?;
+        let user = UserCondition::new(account_sid)?;
+        for port in ports {
+            for (layer, family) in CONNECT_LAYERS {
+                add_proxy_permit(
+                    engine.handle,
+                    Boundary {
+                        provider,
+                        sublayer,
+                        layer,
+                    },
+                    Guidelines::run(),
+                    family,
+                    *port,
+                    &user,
+                )?;
+            }
+        }
+        Ok(Some(Self { _engine: engine }))
+    }
+}
+
 fn add_account_filters<'a>(
     engine: HANDLE,
-    installation: &Installation,
     account: &Account,
     provider: GUID,
     sublayer: GUID,
     keys: &mut impl Iterator<Item = &'a str>,
 ) -> Result<()> {
     let user = UserCondition::new(&account.sid)?;
-    for (layer, family) in [
-        (FWPM_LAYER_ALE_AUTH_CONNECT_V4, AddressFamily::V4),
-        (FWPM_LAYER_ALE_AUTH_CONNECT_V6, AddressFamily::V6),
-    ] {
-        let permit_key = next_filter_key(keys)?;
-        add_proxy_permit(
-            engine,
-            permit_key,
+    for (layer, _) in CONNECT_LAYERS {
+        let boundary = Boundary {
             provider,
             sublayer,
             layer,
-            family,
-            installation.proxy_port_low,
-            installation.proxy_port_high,
-            &user,
-        )?;
-
-        let block_key = next_filter_key(keys)?;
-        add_block(engine, block_key, provider, sublayer, layer, &user)?;
-    }
-
-    for layer in [
-        FWPM_LAYER_ALE_AUTH_LISTEN_V4,
-        FWPM_LAYER_ALE_AUTH_LISTEN_V6,
-        FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-        FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
-    ] {
+        };
         let key = next_filter_key(keys)?;
-        add_block(engine, key, provider, sublayer, layer, &user)?;
+        add_block(engine, boundary, Guidelines::install(key), &user)?;
+    }
+    for layer in INBOUND_LAYERS {
+        let boundary = Boundary {
+            provider,
+            sublayer,
+            layer,
+        };
+        let key = next_filter_key(keys)?;
+        add_block(engine, boundary, Guidelines::install(key), &user)?;
     }
     Ok(())
 }
@@ -182,21 +217,17 @@ fn add_sublayer(engine: HANDLE, provider: GUID, key: GUID) -> Result<()> {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn add_proxy_permit(
     engine: HANDLE,
-    key: GUID,
-    provider: GUID,
-    sublayer: GUID,
-    layer: GUID,
+    boundary: Boundary,
+    guidelines: Guidelines,
     family: AddressFamily,
-    low_port: u16,
-    high_port: u16,
+    port: u16,
     user: &UserCondition,
 ) -> Result<()> {
     let mut port_range = FWP_RANGE0 {
-        valueLow: uint16_value(low_port),
-        valueHigh: uint16_value(high_port),
+        valueLow: uint16_value(port),
+        valueHigh: uint16_value(port),
     };
     let mut v4_loopback = FWP_V4_ADDR_AND_MASK {
         addr: u32::from_be_bytes([127, 0, 0, 0]),
@@ -248,10 +279,8 @@ fn add_proxy_permit(
     ];
     add_filter(
         engine,
-        key,
-        provider,
-        sublayer,
-        layer,
+        boundary,
+        guidelines,
         FWP_ACTION_PERMIT,
         FILTER_WEIGHT_PERMIT,
         &mut conditions,
@@ -260,45 +289,73 @@ fn add_proxy_permit(
 
 fn add_block(
     engine: HANDLE,
-    key: GUID,
-    provider: GUID,
-    sublayer: GUID,
-    layer: GUID,
+    boundary: Boundary,
+    guidelines: Guidelines,
     user: &UserCondition,
 ) -> Result<()> {
     let mut conditions = [user.filter_condition()];
     add_filter(
         engine,
-        key,
-        provider,
-        sublayer,
-        layer,
+        boundary,
+        guidelines,
         FWP_ACTION_BLOCK,
         FILTER_WEIGHT_BLOCK,
         &mut conditions,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_filter(
-    engine: HANDLE,
-    key: GUID,
-    mut provider: GUID,
+#[derive(Clone, Copy)]
+struct Boundary {
+    provider: GUID,
     sublayer: GUID,
     layer: GUID,
+}
+
+#[derive(Clone, Copy)]
+struct Guidelines {
+    key: Option<GUID>,
+    persistent: bool,
+}
+
+impl Guidelines {
+    fn install(key: GUID) -> Self {
+        Self {
+            key: Some(key),
+            persistent: true,
+        }
+    }
+
+    fn run() -> Self {
+        Self {
+            key: None,
+            persistent: false,
+        }
+    }
+}
+
+fn add_filter(
+    engine: HANDLE,
+    boundary: Boundary,
+    guidelines: Guidelines,
     action: u32,
     weight: u8,
     conditions: &mut [FWPM_FILTER_CONDITION0],
 ) -> Result<()> {
     let name = "Landstrip restricted-user network boundary".to_wide_nul();
+    let mut provider = boundary.provider;
+    let flags = if guidelines.persistent {
+        FWPM_FILTER_FLAG_PERSISTENT
+    } else {
+        0
+    };
     let filter = FWPM_FILTER0 {
-        filterKey: key,
+        filterKey: guidelines.key.unwrap_or_else(|| GUID::from_u128(0)),
         displayData: display(&name),
-        flags: FWPM_FILTER_FLAG_PERSISTENT,
+        flags,
         providerKey: &raw mut provider,
         providerData: empty_blob(),
-        layerKey: layer,
-        subLayerKey: sublayer,
+        layerKey: boundary.layer,
+        subLayerKey: boundary.sublayer,
         weight: FWP_VALUE0 {
             r#type: FWP_UINT8,
             Anonymous: FWP_VALUE0_0 { uint8: weight },
@@ -462,13 +519,6 @@ fn parse_key(value: &str) -> Result<GUID> {
     Ok(GUID::from_u128(value))
 }
 
-fn display(name: &[u16]) -> FWPM_DISPLAY_DATA0 {
-    FWPM_DISPLAY_DATA0 {
-        name: name.as_ptr().cast_mut(),
-        description: ptr::null_mut(),
-    }
-}
-
 fn uint16_value(value: u16) -> FWP_VALUE0 {
     FWP_VALUE0 {
         r#type: FWP_UINT16,
@@ -489,5 +539,12 @@ fn empty_value() -> FWP_VALUE0 {
         Anonymous: FWP_VALUE0_0 {
             uint64: ptr::null_mut(),
         },
+    }
+}
+
+fn display(name: &[u16]) -> FWPM_DISPLAY_DATA0 {
+    FWPM_DISPLAY_DATA0 {
+        name: name.as_ptr().cast_mut(),
+        description: ptr::null_mut(),
     }
 }

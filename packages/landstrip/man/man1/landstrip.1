@@ -122,7 +122,7 @@ Set the restricted-network account pool size.
 .It Fl -unrestricted-accounts Ar count
 Set the unrestricted-network account pool size.
 .It Fl -proxy-port-range Ar low-high
-Set the restricted-user loopback proxy range.
+Set the loopback port range restricted-user sandboxes may reach.
 .El
 .Sh POLICY
 Policies and their filesystem sections must be objects.
@@ -229,6 +229,9 @@ permits listed pathname sockets and
 permits all pathname Unix sockets, independently of
 .Va allowNetwork .
 Windows supports neither local binding nor Unix socket policy.
+AppContainer permits loopback TCP to the declared proxy ports.
+Restricted-user mode adds per-run loopback permits for the same ports, so an
+undeclared port stays closed even inside the installed proxy port range.
 .Va allowNetwork
 permits general IP networking without relaxing Unix socket, filesystem, or
 escape-prevention rules.
@@ -269,8 +272,9 @@ Uses AppContainer
 .Pq Va lpac No default or Va standard
 or restricted users with Windows Filtering Platform.
 .Va windows.allowLoopback
-exposes local loopback services in AppContainer mode; restricted-user mode
-permits only the installed proxy port range.
+exposes local loopback services in AppContainer mode.
+Restricted-user accounts reach loopback only for the proxy ports their policy
+declares, all of which must lie inside the installed proxy port range.
 If AppContainer cannot open
 .Pa NUL ,
 run

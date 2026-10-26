@@ -33,7 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use zeroize::Zeroize;
 
-pub(super) const INSTALLATION_VERSION: u32 = 1;
+pub(super) const INSTALLATION_VERSION: u32 = 2;
 const STATE_DIRECTORY: &str = "Landstrip/windows-restricted-user-v1";
 const STATE_FILE: &str = "state.json";
 
@@ -91,7 +91,8 @@ impl Installation {
             .with_context(|| format!("restricted-user installation state {}", path.display()))?;
         if installation.version != INSTALLATION_VERSION {
             bail!(
-                "restricted-user installation version {} is unsupported; expected {}",
+                "restricted-user installation version {} is unsupported; expected {}; \
+                 rerun `landstrip windows install`",
                 installation.version,
                 INSTALLATION_VERSION
             );
@@ -162,7 +163,7 @@ impl Installation {
         {
             return Err(LandstripError::sandbox_setup(
                 Mechanism::Windowsuser,
-                "restricted-user proxy port is outside the installed WFP allow range",
+                "restricted-user proxy port is outside the installed proxy port range",
             )
             .into());
         }

@@ -47,6 +47,17 @@ pub(super) fn execute(
         state::NetworkMode::Restricted
     };
     let lease = lease::Lease::acquire(&installation, network_mode)?;
+    // Loopback stays closed for the account unless this run's policy names the
+    // ports, and then only for as long as the run lasts.
+    let permits = match network_mode {
+        state::NetworkMode::Restricted => wfp::RunPermits::add(
+            &installation,
+            &lease.account().sid,
+            policy.network_access.connect_tcp_ports(),
+        )
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?,
+        state::NetworkMode::Unrestricted => None,
+    };
     let state_dir = state::state_dir()
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     let request_id = account::random_identifier(16)
@@ -95,6 +106,7 @@ pub(super) fn execute(
     let exit_code = launch_result?;
     revoke_result?;
     clear_result?;
+    drop(permits);
     Ok(exit_code.cast_signed())
 }
 
