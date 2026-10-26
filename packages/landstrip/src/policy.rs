@@ -56,6 +56,8 @@ pub(crate) struct AccessPolicy {
     pub(crate) app_container_mode: AppContainerMode,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) allow_windows_loopback: bool,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) allow_windows_additive_grants: bool,
 }
 
 /// How strongly a denied link is protected: `always` links cannot be removed
@@ -512,6 +514,7 @@ impl Settings {
             macos: self.macos.normalize()?,
             app_container_mode: windows.app_container_mode,
             allow_windows_loopback: windows.allow_loopback,
+            allow_windows_additive_grants: windows.allow_additive_grants,
         };
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         policy.validate()?;

@@ -183,6 +183,8 @@ export type LandstripWindowsAppContainerMode = 'lpac' | 'standard';
 export interface LandstripWindowsPolicy {
   appContainerMode?: LandstripWindowsAppContainerMode;
   allowLoopback?: boolean;
+  /** Accept the additive grants the restricted-user backend applies on top of the sandbox account's own rights. */
+  allowAdditiveGrants?: boolean;
 }
 
 export interface LandstripPolicy {
@@ -250,6 +252,8 @@ export interface SandboxDarwinConfig {
 export interface SandboxWindowsConfig {
   appContainerMode: LandstripWindowsAppContainerMode;
   allowLoopback: boolean;
+  /** Accept the additive grants the restricted-user backend applies on top of the sandbox account's own rights. */
+  allowAdditiveGrants?: boolean;
 }
 
 export interface SandboxConfig {

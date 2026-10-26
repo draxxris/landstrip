@@ -40,6 +40,7 @@ pub(super) fn execute(
     args: &[OsString],
 ) -> Result<i32> {
     let installation = state::Installation::load_ready()?;
+    refuse_additive_grants(policy)?;
     let network_mode = if policy.network_access.is_unrestricted() {
         state::NetworkMode::Unrestricted
     } else {
@@ -112,8 +113,25 @@ pub(super) fn execute(
 
 pub(super) fn validate(policy: &AccessPolicy) -> Result<()> {
     let installation = state::Installation::load_ready()?;
+    refuse_additive_grants(policy)?;
     if !policy.network_access.is_unrestricted() {
         installation.validate_restricted_network(policy)?;
     }
     Ok(())
+}
+
+/// A leased account keeps its own `Users` rights, so an `allowRead`/`allowWrite`
+/// allowlist is only ever tightened, never enforced, by the grants applied here.
+/// Refuse to run such a policy unless the caller accepts that difference.
+fn refuse_additive_grants(policy: &AccessPolicy) -> Result<()> {
+    if policy.allow_windows_additive_grants {
+        return Ok(());
+    }
+    Err(Error::sandbox_setup(
+        Mechanism::Windowsuser,
+        "restricted-user isolation cannot enforce allowRead/allowWrite allowlists; \
+         set windows.allowAdditiveGrants to accept additive grants or uninstall it \
+         to use the AppContainer backend",
+    )
+    .into())
 }

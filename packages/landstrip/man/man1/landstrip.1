@@ -153,7 +153,8 @@ Example fields, subject to the platform limits below:
     "allowAppleEvents": false, "allowPty": false,
     "logTag": "agent-session-42"
   },
-  "windows": { "appContainerMode": "lpac", "allowLoopback": false }
+  "windows": { "appContainerMode": "lpac", "allowLoopback": false,
+               "allowAdditiveGrants": false }
 }
 .Ed
 .Pp
@@ -275,6 +276,16 @@ or restricted users with Windows Filtering Platform.
 exposes local loopback services in AppContainer mode.
 Restricted-user accounts reach loopback only for the proxy ports their policy
 declares, all of which must lie inside the installed proxy port range.
+A restricted-user account keeps its own
+.Sq Users
+rights, so
+.Va allowRead
+and
+.Va allowWrite
+permits are additive rather than an allowlist.
+Landstrip refuses such a policy unless
+.Va windows.allowAdditiveGrants
+is set.
 If AppContainer cannot open
 .Pa NUL ,
 run

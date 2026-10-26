@@ -167,6 +167,10 @@ pub(crate) enum AppContainerMode {
 pub(crate) struct SandboxWindows {
     pub(crate) app_container_mode: AppContainerMode,
     pub(crate) allow_loopback: bool,
+    /// Accept the additive grants the restricted-user backend applies on top of
+    /// the sandbox account's own rights. Without this the backend refuses to run
+    /// an allowlist policy it cannot enforce.
+    pub(crate) allow_additive_grants: bool,
 }
 
 impl Settings {

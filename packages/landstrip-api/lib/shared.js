@@ -603,6 +603,9 @@ function buildLandstripPolicy(options) {
       appContainerMode: options.windows.appContainerMode ?? 'lpac',
       allowLoopback: Boolean(options.windows.allowLoopback),
     };
+    if (options.windows.allowAdditiveGrants) {
+      policy.windows.allowAdditiveGrants = true;
+    }
   }
   return policy;
 }
@@ -819,7 +822,11 @@ function parseSandboxConfig(value) {
 
   if (value.windows !== undefined) {
     requireSandboxObject(value.windows, 'windows');
-    rejectUnknownSandboxFields(value.windows, ['appContainerMode', 'allowLoopback'], 'windows.');
+    rejectUnknownSandboxFields(
+      value.windows,
+      ['appContainerMode', 'allowLoopback', 'allowAdditiveGrants'],
+      'windows.',
+    );
     if (
       value.windows.appContainerMode !== undefined &&
       value.windows.appContainerMode !== 'standard' &&
@@ -827,13 +834,16 @@ function parseSandboxConfig(value) {
     ) {
       throw new Error('windows.appContainerMode must be lpac or standard');
     }
-    validateBooleanFields(value.windows, ['allowLoopback'], 'windows.');
+    validateBooleanFields(value.windows, ['allowLoopback', 'allowAdditiveGrants'], 'windows.');
     config.windows = {};
     if (value.windows.appContainerMode !== undefined) {
       config.windows.appContainerMode = value.windows.appContainerMode;
     }
     if (value.windows.allowLoopback !== undefined) {
       config.windows.allowLoopback = value.windows.allowLoopback;
+    }
+    if (value.windows.allowAdditiveGrants !== undefined) {
+      config.windows.allowAdditiveGrants = value.windows.allowAdditiveGrants;
     }
   }
 
@@ -893,6 +903,11 @@ function deepMergeSandboxConfig(base, overrides) {
       appContainerMode: windows?.appContainerMode ?? base.windows?.appContainerMode ?? 'standard',
       allowLoopback: windows?.allowLoopback ?? base.windows?.allowLoopback ?? false,
     };
+    const allowAdditiveGrants =
+      windows?.allowAdditiveGrants ?? base.windows?.allowAdditiveGrants;
+    if (allowAdditiveGrants !== undefined) {
+      result.windows.allowAdditiveGrants = allowAdditiveGrants;
+    }
   }
 
   return result;
