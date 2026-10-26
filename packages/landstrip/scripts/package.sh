@@ -22,6 +22,8 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=package-target.sh
 source "$script_dir/package-target.sh"
+# shellcheck source=../../../scripts/sha256.sh
+source "$script_dir/../../../scripts/sha256.sh"
 
 CARGO="${CARGO:-cargo}"
 RUSTC="${RUSTC:-rustc}"
@@ -44,17 +46,6 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
-
-sha256_digest() {
-  local output
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    output="$(sha256sum "$1")"
-  else
-    output="$(shasum -a 256 "$1")"
-  fi
-  printf '%s\n' "${output%% *}"
 }
 
 create_tar_artifact() {
