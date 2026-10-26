@@ -203,6 +203,11 @@ adds exceptions to
 .Va denyRead ,
 but never
 .Va denyReadAlways .
+A write root nested inside a
+.Va denyRead
+root stays writable, because
+.Va denyRead
+removes read access only.
 Protected roots and descendants stay denied across moves, hard links,
 canonical symlink aliases, and broker approval.
 Denied roots and descendants also cannot be removed.

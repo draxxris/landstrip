@@ -581,10 +581,11 @@ impl PathAccessEntry {
             ));
         }
         for path in &policy.read_denied_roots {
-            entries.push(Self::subtree_deny(
-                path,
-                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE,
-            ));
+            // Traverse (`FILE_TRAVERSE`/`FILE_GENERIC_EXECUTE` on a directory) is
+            // deliberately absent: a granted write root nested in a read-denied
+            // subtree must stay writable, as it does under Seatbelt and Landlock.
+            // Executing a binary in the subtree still needs read access to it.
+            entries.push(Self::subtree_deny(path, FILE_GENERIC_READ | DELETE));
         }
         Ok(entries)
     }

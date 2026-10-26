@@ -481,8 +481,7 @@ impl Settings {
 
         #[cfg(target_os = "windows")]
         let (write_allow, write_deny) = {
-            let write_roots =
-                lower_windows_write_access(&write_allow, write_deny, &read_denied_roots);
+            let write_roots = lower_windows_write_access(&write_allow, write_deny);
             (write_roots.allow, write_roots.deny)
         };
 
@@ -573,7 +572,6 @@ fn retain_windows_deny_roots(paths: &mut Vec<PathBuf>) {
 fn lower_windows_write_access(
     write_allow: &[PathBuf],
     mut write_deny: Vec<PathBuf>,
-    read_denied_roots: &[PathBuf],
 ) -> WindowsWriteRoots {
     // Windows ACLs cannot attach deny entries to paths that do not exist or to
     // volume roots. Nested denials under `allowWrite` are enforced by explicit
@@ -581,9 +579,11 @@ fn lower_windows_write_access(
     // write permission for sibling creation.
     retain_windows_deny_roots(&mut write_deny);
 
+    // `denyRead` gates reads only; it must not cancel a granted write root the
+    // way a `denyWrite` does.
     let mut carved_writes: Vec<PathBuf> = write_allow
         .iter()
-        .filter(|allow| !allow.is_under_any(&write_deny) && !allow.is_under_any(read_denied_roots))
+        .filter(|allow| !allow.is_under_any(&write_deny))
         .cloned()
         .collect();
     carved_writes.normalize_roots();
