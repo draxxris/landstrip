@@ -176,6 +176,17 @@ Path entries accept bare strings, explicit literal selectors
 .Pq Dq literal ,
 or explicit glob selectors
 .Pq Dq glob .
+Path globs follow the platform path syntax: a single
+.Va *
+or
+.Va \&?
+never spans a path separator, a double asterisk followed by a separator also
+matches zero directories
+.Po so
+.Dq **/.env
+covers the granted root itself
+.Pc ,
+and Windows matching is case-insensitive.
 .Ss Filesystem
 Writes default to denied.
 .Va allowWrite

@@ -30,7 +30,7 @@ use std::fs;
 use std::io;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1015,13 +1015,46 @@ fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
     paths.push(normalize_path(path));
 }
 
+#[derive(Clone, Copy)]
+struct PathSyntax {
+    separator: u8,
+    case_insensitive: bool,
+}
+
+impl PathSyntax {
+    const HOST: Self = Self {
+        separator: MAIN_SEPARATOR as u8,
+        case_insensitive: cfg!(windows),
+    };
+
+    fn is_separator(self, byte: u8) -> bool {
+        byte == self.separator
+    }
+
+    fn fold(self, byte: u8) -> u8 {
+        if self.case_insensitive {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        }
+    }
+
+    fn matches_byte(self, pattern: u8, text: u8) -> bool {
+        self.fold(pattern) == self.fold(text)
+    }
+}
+
 pub(crate) struct GlobPattern<'a> {
     pattern: &'a str,
+    syntax: PathSyntax,
 }
 
 impl<'a> GlobPattern<'a> {
     pub(crate) fn new(pattern: &'a str) -> Self {
-        Self { pattern }
+        Self {
+            pattern,
+            syntax: PathSyntax::HOST,
+        }
     }
 
     pub(crate) fn is_glob_byte(byte: u8) -> bool {
@@ -1037,17 +1070,19 @@ impl<'a> GlobPattern<'a> {
             return PathBuf::from(self.pattern);
         };
         let prefix = &self.pattern[..glob_at];
-        let base = if prefix.ends_with('/') {
-            Path::new(prefix.trim_end_matches('/'))
+        let mut base = if prefix.as_bytes().last() == Some(&(MAIN_SEPARATOR as u8)) {
+            PathBuf::from(prefix)
         } else {
-            Path::new(prefix).parent().unwrap_or(Path::new("/"))
+            Path::new(prefix)
+                .parent()
+                .map_or_else(|| PathBuf::from(prefix), Path::to_path_buf)
         };
 
         if base.as_os_str().is_empty() {
-            PathBuf::from("/")
-        } else {
-            base.to_path_buf()
+            base.push(MAIN_SEPARATOR.to_string());
         }
+
+        base
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1148,7 +1183,7 @@ impl<'a> GlobPattern<'a> {
 
         let result = if pattern_at == pattern.len() {
             text_at == text.len()
-        } else if pattern[pattern_at..].starts_with(b"**/") {
+        } else if self.globstar_at_separator(pattern, pattern_at) {
             self.globstar_slash_matches(pattern, text, pattern_at, text_at, memo)
         } else if pattern[pattern_at..].starts_with(b"**") {
             self.globstar_matches(pattern, text, pattern_at, text_at, memo)
@@ -1157,13 +1192,13 @@ impl<'a> GlobPattern<'a> {
                 b'*' => self.star_matches(pattern, text, pattern_at, text_at, memo),
                 b'?' => {
                     text_at < text.len()
-                        && text[text_at] != b'/'
+                        && !self.syntax.is_separator(text[text_at])
                         && self.matches_at(pattern, text, pattern_at + 1, text_at + 1, memo)
                 }
                 b'[' => self.class_matches(pattern, text, pattern_at, text_at, memo),
                 byte => {
                     text_at < text.len()
-                        && text[text_at] == byte
+                        && self.syntax.matches_byte(byte, text[text_at])
                         && self.matches_at(pattern, text, pattern_at + 1, text_at + 1, memo)
                 }
             }
@@ -1171,6 +1206,13 @@ impl<'a> GlobPattern<'a> {
 
         memo[memo_at] = Some(result);
         result
+    }
+
+    fn globstar_at_separator(&self, pattern: &[u8], pattern_at: usize) -> bool {
+        pattern[pattern_at..].starts_with(b"**")
+            && pattern
+                .get(pattern_at + 2)
+                .is_some_and(|byte| self.syntax.is_separator(*byte))
     }
 
     fn globstar_slash_matches(
@@ -1186,7 +1228,8 @@ impl<'a> GlobPattern<'a> {
         }
 
         for next in text_at..text.len() {
-            if text[next] == b'/' && self.matches_at(pattern, text, pattern_at + 3, next + 1, memo)
+            if self.syntax.is_separator(text[next])
+                && self.matches_at(pattern, text, pattern_at + 3, next + 1, memo)
             {
                 return true;
             }
@@ -1225,7 +1268,7 @@ impl<'a> GlobPattern<'a> {
             if self.matches_at(pattern, text, pattern_at + 1, next, memo) {
                 return true;
             }
-            if next == text.len() || text[next] == b'/' {
+            if next == text.len() || self.syntax.is_separator(text[next]) {
                 break;
             }
             next += 1;
@@ -1248,27 +1291,28 @@ impl<'a> GlobPattern<'a> {
             .map(|offset| pattern_at + 1 + offset)
         else {
             return text_at < text.len()
-                && text[text_at] == b'['
+                && self.syntax.matches_byte(b'[', text[text_at])
                 && self.matches_at(pattern, text, pattern_at + 1, text_at + 1, memo);
         };
 
         text_at < text.len()
-            && text[text_at] != b'/'
-            && Self::byte_in_class(text[text_at], &pattern[pattern_at + 1..class_end])
+            && !self.syntax.is_separator(text[text_at])
+            && self.byte_in_class(text[text_at], &pattern[pattern_at + 1..class_end])
             && self.matches_at(pattern, text, class_end + 1, text_at + 1, memo)
     }
 
-    fn byte_in_class(byte: u8, class: &[u8]) -> bool {
+    fn byte_in_class(&self, byte: u8, class: &[u8]) -> bool {
+        let byte = self.syntax.fold(byte);
         let mut at = 0;
 
         while at < class.len() {
             if at + 2 < class.len() && class[at + 1] == b'-' {
-                if byte >= class[at] && byte <= class[at + 2] {
+                if byte >= self.syntax.fold(class[at]) && byte <= self.syntax.fold(class[at + 2]) {
                     return true;
                 }
                 at += 3;
             } else {
-                if byte == class[at] {
+                if self.syntax.matches_byte(class[at], byte) {
                     return true;
                 }
                 at += 1;
