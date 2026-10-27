@@ -120,9 +120,12 @@ package_target_root="${CARGO_TARGET_DIR:-$repo_root/packages/landstrip/target/pa
 # Release outputs produced on another host (e.g. ad-hoc signed Mach-O binaries
 # exported from macOS) are staged as-is instead of being rebuilt here.
 prebuilt_root="${PREBUILT_ROOT:-}"
+if [[ -z "$prebuilt_root" && -d "$cargo_root/target/prebuilt" ]]; then
+  prebuilt_root="$cargo_root/target/prebuilt"
+fi
 if [[ -n "$prebuilt_root" ]]; then
   prebuilt_root="$(cd "$prebuilt_root" 2>/dev/null && pwd)" \
-    || die "PREBUILT_ROOT is not a directory: $PREBUILT_ROOT"
+    || die "PREBUILT_ROOT is not a directory: $prebuilt_root"
 fi
 
 # platform|rust-triple|binary-name
