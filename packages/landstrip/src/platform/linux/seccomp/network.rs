@@ -110,13 +110,35 @@ pub(super) struct IpEndpoint {
     pub(super) loopback: bool,
 }
 
+/// Address family decoded from the leading field of a raw socket address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SockAddrFamily(libc::sa_family_t);
+
+impl TryFrom<&[u8]> for SockAddrFamily {
+    type Error = BrokerError;
+
+    fn try_from(addr: &[u8]) -> SysResult<Self> {
+        let bytes = addr
+            .get(..mem::size_of::<libc::sa_family_t>())
+            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+            .ok_or(BrokerError::InvalidAddress)?;
+        Ok(Self(libc::sa_family_t::from_ne_bytes(bytes)))
+    }
+}
+
+impl From<SockAddrFamily> for i32 {
+    fn from(family: SockAddrFamily) -> Self {
+        i32::from(family.0)
+    }
+}
+
 impl TargetSocket {
     fn ip_endpoint(&self) -> SysResult<IpEndpoint> {
         IpEndpoint::parse(&self.addr, self.info.domain)
     }
 
     fn family(&self) -> SysResult<i32> {
-        sockaddr_family(&self.addr)
+        Ok(i32::from(SockAddrFamily::try_from(self.addr.as_slice())?))
     }
 
     fn unix_path(&self) -> Option<PathBuf> {
@@ -541,17 +563,9 @@ fn handle_unix_bind(
     Ok(NotificationResult::grant(grant))
 }
 
-fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {
-    let family = addr
-        .get(..mem::size_of::<libc::sa_family_t>())
-        .ok_or(BrokerError::InvalidAddress)?;
-    let family = <[u8; 2]>::try_from(family).map_err(|_| BrokerError::InvalidAddress)?;
-    Ok(i32::from(libc::sa_family_t::from_ne_bytes(family)))
-}
-
 impl IpEndpoint {
     fn parse(addr: &[u8], domain: i32) -> SysResult<Self> {
-        match (domain, sockaddr_family(addr)?) {
+        match (domain, i32::from(SockAddrFamily::try_from(addr)?)) {
             (libc::AF_INET, libc::AF_INET) => {
                 if addr.len() < mem::size_of::<libc::sockaddr_in>() {
                     return Err(BrokerError::InvalidAddress);
