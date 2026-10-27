@@ -52,6 +52,29 @@ pub fn unix_connect_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
+/// Re-exec probe: bind a Unix socket. Exit 0 when the sandbox denies the bind,
+/// 1 when it unexpectedly succeeds.
+#[cfg(unix)]
+pub fn unix_bind_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::net::UnixListener;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    match UnixListener::bind(path) {
+        Ok(_) => 1,
+        Err(error) => match error.raw_os_error() {
+            Some(libc::EACCES | libc::EPERM) => 0,
+            _ => 2,
+        },
+    }
+}
+
+#[cfg(not(unix))]
+pub fn unix_bind_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
 #[cfg(target_os = "macos")]
 pub fn route_socket_probe() -> i32 {
     let fd = unsafe { libc::socket(libc::AF_ROUTE, libc::SOCK_RAW, 0) };

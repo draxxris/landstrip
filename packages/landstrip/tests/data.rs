@@ -173,6 +173,7 @@ enum Net {
     LoopbackAllowed,
     UnixAllowed,
     UnixDenied,
+    UnixReported,
     UnixAbstractDenied,
     UnixSupervisorAllowed,
     UnixSupervisorDenied,
@@ -623,6 +624,7 @@ fn parse_net(value: &str) -> Net {
         "loopback-allowed" => Net::LoopbackAllowed,
         "unix-allowed" => Net::UnixAllowed,
         "unix-denied" => Net::UnixDenied,
+        "unix-reported" => Net::UnixReported,
         "unix-abstract-denied" => Net::UnixAbstractDenied,
         "unix-supervisor-allowed" => Net::UnixSupervisorAllowed,
         "unix-supervisor-denied" => Net::UnixSupervisorDenied,
@@ -667,8 +669,20 @@ fn non_loopback_ipv4() -> Option<Ipv4Addr> {
 }
 
 fn landstrip_net(ctx: &Context, format: PolicyFormat, policies: &[PathBuf]) -> Command {
+    landstrip_command(ctx, format, policies, false)
+}
+
+fn landstrip_command(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    trap: bool,
+) -> Command {
     let mut command = Command::new(&ctx.bin);
     command.arg("run");
+    if trap {
+        command.args(["--trap", "3"]);
+    }
     if format == PolicyFormat::Yaml {
         command.args(["--policy-format", "yaml"]);
     }
@@ -705,6 +719,7 @@ fn run_net(
             run_unix_allowed(ctx, format, policies, &dir.join(resolver.subst(rel)))
         }
         Net::UnixDenied => run_unix_denied(ctx, format, policies, dir),
+        Net::UnixReported => run_unix_reported(case, ctx, format, policies, dir),
         Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
         Net::UnixSupervisorAllowed | Net::UnixSupervisorDenied => {
             let rel = case
@@ -716,6 +731,7 @@ fn run_net(
                 ctx,
                 format,
                 policies,
+                dir,
                 &dir.join(resolver.subst(rel)),
                 matches!(net, Net::UnixSupervisorAllowed),
             )
@@ -1029,6 +1045,61 @@ fn run_unix_supervisor(
     Err("unix supervisor sockets are unix-only".to_owned())
 }
 
+/// A denied unix connect that must still be reported. The listening socket is
+/// bound before the sandbox starts so the broker resolves the target and
+/// reaches the policy decision instead of failing on a missing path.
+#[cfg(unix)]
+fn run_unix_reported(
+    case: &Case,
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    dir: &Path,
+) -> Result<(), String> {
+    let sock = dir.join("reported.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).map_err(|e| format!("bind unix server: {e}"))?;
+    let server = std::thread::spawn(move || listener.accept().is_ok());
+
+    let trapfd_path = case.trapfd_path(dir);
+    let mut command = landstrip_command(ctx, format, policies, case.trap_fd);
+    command.arg(&ctx.nc).arg("-U").arg(&sock);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let responder = attach_fd3(&mut command, trapfd_path.as_deref(), case.grant, None);
+    let child = command
+        .spawn()
+        .map_err(|e| format!("unix reported connect spawn: {e}"))?;
+    drop(command);
+    if let Some(responder) = responder {
+        responder
+            .join()
+            .map_err(|_| "trap responder panicked")?
+            .map_err(|e| format!("trap responder: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("unix reported connect wait: {e}"))?;
+    let _ = UnixStream::connect(&sock);
+    let _ = server.join();
+    let _ = std::fs::remove_file(&sock);
+
+    let merged = merge(&output.stdout, &output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+    case.check_status(code, &merged)?;
+    case.check_output(&merged, trapfd_path.as_deref())
+}
+
+#[cfg(not(unix))]
+fn run_unix_reported(
+    _case: &Case,
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+    _dir: &Path,
+) -> Result<(), String> {
+    Err("unix-reported is unix-only".to_owned())
+}
+
 /// A service manager socket named by the policy defaults. The sandbox runs with
 /// `XDG_RUNTIME_DIR` pointing at the socket's directory and
 /// `DBUS_SESSION_BUS_ADDRESS` naming the socket, so both discovery paths are
@@ -1039,6 +1110,7 @@ fn run_unix_supervisor(
     ctx: &Context,
     format: PolicyFormat,
     policies: &[PathBuf],
+    dir: &Path,
     sock: &Path,
     allowed: bool,
 ) -> Result<(), String> {
@@ -1049,7 +1121,9 @@ fn run_unix_supervisor(
     let listener = UnixListener::bind(sock).map_err(|e| format!("bind unix server: {e}"))?;
     let server = std::thread::spawn(move || listener.accept().is_ok());
 
-    let output = landstrip_net(ctx, format, policies)
+    let trapfd_path = case.trapfd_path(dir);
+    let mut command = landstrip_command(ctx, format, policies, case.trap_fd);
+    command
         .env("XDG_RUNTIME_DIR", runtime)
         .env(
             "DBUS_SESSION_BUS_ADDRESS",
@@ -1057,11 +1131,22 @@ fn run_unix_supervisor(
         )
         .arg(&ctx.nc)
         .arg("-U")
-        .arg(sock)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .arg(sock);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let responder = attach_fd3(&mut command, trapfd_path.as_deref(), case.grant, None);
+    let child = command
+        .spawn()
         .map_err(|error| format!("unix supervisor connect spawn: {error}"))?;
+    drop(command);
+    if let Some(responder) = responder {
+        responder
+            .join()
+            .map_err(|_| "trap responder panicked")?
+            .map_err(|e| format!("trap responder: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("unix supervisor connect wait: {error}"))?;
     let _ = UnixStream::connect(sock);
     let _ = server.join();
     let _ = std::fs::remove_file(sock);
@@ -1074,7 +1159,8 @@ fn run_unix_supervisor(
             merged.trim()
         ));
     }
-    case.check_status(output.status.code().unwrap_or(-1), &merged)
+    case.check_status(output.status.code().unwrap_or(-1), &merged)?;
+    case.check_output(&merged, trapfd_path.as_deref())
 }
 
 #[cfg(target_os = "linux")]

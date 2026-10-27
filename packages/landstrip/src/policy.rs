@@ -430,7 +430,11 @@ impl UnixSocketAccess {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum UnixPathAccess {
     Allowed,
+    /// Denied by policy; the interactive supervisor may offer a grant.
     Denied,
+    /// Names a service manager socket. No grant can make this safe, so the
+    /// denial is terminal and the broker only reports it.
+    Supervisor,
 }
 
 /// Sockets a sandboxed child could use to ask an unsandboxed service manager to
@@ -525,7 +529,7 @@ impl AccessPolicy {
         object: Option<BorrowedFd<'_>>,
     ) -> UnixPathAccess {
         if self.supervisor_sockets.contains(target, object) {
-            return UnixPathAccess::Denied;
+            return UnixPathAccess::Supervisor;
         }
         match self.network_access.unix_socket_access() {
             UnixSocketAccess::Unrestricted => UnixPathAccess::Allowed,

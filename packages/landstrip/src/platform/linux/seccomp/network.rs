@@ -214,7 +214,7 @@ pub(super) fn handle_bind(
                 libc::bind,
             )))
         }
-        SocketKind::Unix => handle_unix_bind(policy, request.pid, socket),
+        SocketKind::Unix => handle_unix_bind(policy, request.pid, socket, denials),
         SocketKind::NotSupported if policy.network_access.is_unrestricted() => Ok(
             NotificationResult::grant(SocketGrant::new(socket, libc::bind)),
         ),
@@ -286,7 +286,7 @@ pub(super) fn handle_connect(
                 libc::connect,
             )))
         }
-        SocketKind::Unix => handle_unix_connect(policy, request.pid, socket),
+        SocketKind::Unix => handle_unix_connect(policy, request.pid, socket, denials),
         SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::NotSupported if policy.network_access.is_unrestricted() => {
             Ok(NotificationResult::Continue)
@@ -403,91 +403,142 @@ fn handle_unix_connect(
     policy: &AccessPolicy,
     pid: u32,
     mut socket: TargetSocket,
+    denials: &mut Denials<'_>,
 ) -> SysResult<NotificationResult> {
+    let process = TargetProcess::from_raw(pid);
     let Some(path) = socket.unix_path() else {
-        return if matches!(
+        if matches!(
             policy.network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
         ) {
-            Ok(NotificationResult::Continue)
-        } else {
-            Err(BrokerError::PolicyDenied)
-        };
+            return Ok(NotificationResult::Continue);
+        }
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Connect,
+                "abstract".to_owned(),
+                process.context(),
+            ),
+            false,
+            None,
+        );
     };
-    let process = TargetProcess::from_raw(pid);
     let filesystem = process.filesystem()?;
     let target = filesystem.resolve(libc::AT_FDCWD, &path, true, MissingTarget::Disallow, 0)?;
     let anchor = target.anchor.ok_or(BrokerError::SystemCall {
         errno: libc::ENOENT,
     })?;
-    authorize_unix_path(
-        policy,
-        &target.label,
-        anchor.target.as_ref().map(AsFd::as_fd),
-    )?;
+    let access = policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
+    if let UnixPathAccess::Supervisor = access {
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Connect,
+                target.label.to_string_lossy().into_owned(),
+                process.context(),
+            ),
+            false,
+            None,
+        );
+    }
     let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
     socket.rewrite_unix_path(&Path::new("/proc/self/fd").join(object.as_raw_fd().to_string()))?;
-
-    Ok(NotificationResult::grant(SocketGrant {
+    let grant = SocketGrant {
         sock: socket.sock,
         addr: socket.addr,
         call: libc::connect,
         _path: Some(anchor),
-    }))
+    };
+    if let UnixPathAccess::Denied = access {
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Connect,
+                target.label.to_string_lossy().into_owned(),
+                process.context(),
+            ),
+            true,
+            Some(Grant::from(grant)),
+        );
+    }
+
+    Ok(NotificationResult::grant(grant))
 }
 
 fn handle_unix_bind(
     policy: &AccessPolicy,
     pid: u32,
     mut socket: TargetSocket,
+    denials: &mut Denials<'_>,
 ) -> SysResult<NotificationResult> {
+    let process = TargetProcess::from_raw(pid);
     let Some(path) = socket.unix_path() else {
-        return if matches!(
+        if matches!(
             policy.network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
         ) {
-            Ok(NotificationResult::grant(SocketGrant::new(
+            return Ok(NotificationResult::grant(SocketGrant::new(
                 socket,
                 libc::bind,
-            )))
-        } else {
-            Err(BrokerError::PolicyDenied)
-        };
+            )));
+        }
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Bind,
+                "abstract".to_owned(),
+                process.context(),
+            ),
+            false,
+            None,
+        );
     };
-    let process = TargetProcess::from_raw(pid);
     let filesystem = process.filesystem()?;
     let target = filesystem.resolve(libc::AT_FDCWD, &path, false, MissingTarget::File, 0)?;
     let anchor = target.anchor.ok_or(BrokerError::SystemCall {
         errno: libc::ENOENT,
     })?;
-    authorize_unix_path(
-        policy,
-        &target.label,
-        anchor.target.as_ref().map(AsFd::as_fd),
-    )?;
+    let access = policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
+    if let UnixPathAccess::Supervisor = access {
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Bind,
+                target.label.to_string_lossy().into_owned(),
+                process.context(),
+            ),
+            false,
+            None,
+        );
+    }
     if policy.write_reason(&target.label, true).is_some() {
-        return Err(BrokerError::PolicyDenied);
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Bind,
+                target.label.to_string_lossy().into_owned(),
+                process.context(),
+            ),
+            false,
+            None,
+        );
     }
     let broker_path = anchor.path()?;
     socket.rewrite_unix_path(Path::new(OsStr::from_bytes(broker_path.as_bytes())))?;
-
-    Ok(NotificationResult::grant(SocketGrant {
+    let grant = SocketGrant {
         sock: socket.sock,
         addr: socket.addr,
         call: libc::bind,
         _path: Some(anchor),
-    }))
-}
-
-fn authorize_unix_path(
-    policy: &AccessPolicy,
-    target: &Path,
-    object: Option<BorrowedFd<'_>>,
-) -> SysResult<()> {
-    match policy.unix_path_access(target, object) {
-        UnixPathAccess::Allowed => Ok(()),
-        UnixPathAccess::Denied => Err(BrokerError::PolicyDenied),
+    };
+    if let UnixPathAccess::Denied = access {
+        return denials.deny(
+            Denial::Network(
+                NetworkOperation::Bind,
+                target.label.to_string_lossy().into_owned(),
+                process.context(),
+            ),
+            true,
+            Some(Grant::from(grant)),
+        );
     }
+
+    Ok(NotificationResult::grant(grant))
 }
 
 fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {
