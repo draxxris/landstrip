@@ -146,7 +146,8 @@ Example fields, subject to the platform limits below:
   "network": {
     "allowNetwork": false, "allowLocalBinding": false,
     "httpProxyPort": 8080, "socksProxyPort": 8081,
-    "allowUnixSockets": [], "allowAllUnixSockets": false
+    "allowUnixSockets": [], "allowAllUnixSockets": false,
+    "supervisorSockets": null
   },
   "macos": {
     "allowTrustd": false, "allowMachLookup": [],
@@ -236,6 +237,23 @@ undeclared port stays closed even inside the installed proxy port range.
 .Va allowNetwork
 permits general IP networking without relaxing Unix socket, filesystem, or
 escape-prevention rules.
+.Pp
+Linux keeps service manager sockets denied even under
+.Va allowAllUnixSockets :
+approving one would start a process outside the sandbox.
+The default set is discovered from
+.Ev DBUS_SYSTEM_BUS_ADDRESS ,
+.Ev DBUS_SESSION_BUS_ADDRESS ,
+and
+.Ev XDG_RUNTIME_DIR ,
+falling back to
+.Pa /run/dbus/system_bus_socket ,
+.Pa /run/systemd ,
+and
+.Pa /run/user/<uid> .
+.Va supervisorSockets
+replaces that set, so a policy naming its own service manager is not also
+restricted to this host's sockets.
 .Ss Platform enforcement
 .Bl -tag -width Windows
 .It Linux

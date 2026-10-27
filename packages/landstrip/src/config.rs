@@ -135,6 +135,8 @@ pub(crate) struct SandboxNetwork {
     pub(crate) allow_local_binding: bool,
     pub(crate) allow_all_unix_sockets: bool,
     pub(crate) allow_unix_sockets: Vec<PathSelector>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) supervisor_sockets: Option<Vec<PathSelector>>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
 }

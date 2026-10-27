@@ -174,6 +174,8 @@ enum Net {
     UnixAllowed,
     UnixDenied,
     UnixAbstractDenied,
+    UnixSupervisorAllowed,
+    UnixSupervisorDenied,
 }
 
 struct Case {
@@ -397,15 +399,7 @@ impl Case {
         };
 
         if let Some(net) = &self.net {
-            return run_net(
-                ctx,
-                net,
-                self.format,
-                &policies,
-                resolver,
-                dir,
-                &self.unixsock,
-            );
+            return run_net(self, net, ctx, self.format, &policies, resolver, dir);
         }
 
         let mut command = if let Some(launcher) = &self.launcher {
@@ -630,6 +624,8 @@ fn parse_net(value: &str) -> Net {
         "unix-allowed" => Net::UnixAllowed,
         "unix-denied" => Net::UnixDenied,
         "unix-abstract-denied" => Net::UnixAbstractDenied,
+        "unix-supervisor-allowed" => Net::UnixSupervisorAllowed,
+        "unix-supervisor-denied" => Net::UnixSupervisorDenied,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -685,13 +681,13 @@ fn landstrip_net(ctx: &Context, format: PolicyFormat, policies: &[PathBuf]) -> C
 }
 
 fn run_net(
-    ctx: &Context,
+    case: &Case,
     net: &Net,
+    ctx: &Context,
     format: PolicyFormat,
     policies: &[PathBuf],
     resolver: &Resolver,
     dir: &Path,
-    unixsock: &Option<String>,
 ) -> Result<(), String> {
     match net {
         Net::ListenerDenied | Net::ListenerAllowed => {
@@ -702,13 +698,28 @@ fn run_net(
         Net::ConnectAllowed => run_connect_allowed(ctx, dir),
         Net::LoopbackAllowed => run_loopback_allowed(ctx, format, policies),
         Net::UnixAllowed => {
-            let rel = unixsock
+            let rel = case
+                .unixsock
                 .as_ref()
                 .ok_or_else(|| "unix-allowed needs unixsock".to_owned())?;
             run_unix_allowed(ctx, format, policies, &dir.join(resolver.subst(rel)))
         }
         Net::UnixDenied => run_unix_denied(ctx, format, policies, dir),
         Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
+        Net::UnixSupervisorAllowed | Net::UnixSupervisorDenied => {
+            let rel = case
+                .unixsock
+                .as_ref()
+                .ok_or_else(|| "unix supervisor case needs unixsock".to_owned())?;
+            run_unix_supervisor(
+                case,
+                ctx,
+                format,
+                policies,
+                &dir.join(resolver.subst(rel)),
+                matches!(net, Net::UnixSupervisorAllowed),
+            )
+        }
     }
 }
 
@@ -1003,6 +1014,67 @@ fn run_unix_denied(
     _dir: &Path,
 ) -> Result<(), String> {
     Err("unix-denied is unix-only".to_owned())
+}
+
+#[cfg(not(unix))]
+fn run_unix_supervisor(
+    _case: &Case,
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+    _dir: &Path,
+    _sock: &Path,
+    _allowed: bool,
+) -> Result<(), String> {
+    Err("unix supervisor sockets are unix-only".to_owned())
+}
+
+/// A service manager socket named by the policy defaults. The sandbox runs with
+/// `XDG_RUNTIME_DIR` pointing at the socket's directory and
+/// `DBUS_SESSION_BUS_ADDRESS` naming the socket, so both discovery paths are
+/// exercised without depending on the host's own session bus.
+#[cfg(unix)]
+fn run_unix_supervisor(
+    case: &Case,
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    sock: &Path,
+    allowed: bool,
+) -> Result<(), String> {
+    let runtime = sock
+        .parent()
+        .ok_or_else(|| format!("unix supervisor socket {} has no parent", sock.display()))?;
+    let _ = std::fs::remove_file(sock);
+    let listener = UnixListener::bind(sock).map_err(|e| format!("bind unix server: {e}"))?;
+    let server = std::thread::spawn(move || listener.accept().is_ok());
+
+    let output = landstrip_net(ctx, format, policies)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", sock.display()),
+        )
+        .arg(&ctx.nc)
+        .arg("-U")
+        .arg(sock)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("unix supervisor connect spawn: {error}"))?;
+    let _ = UnixStream::connect(sock);
+    let _ = server.join();
+    let _ = std::fs::remove_file(sock);
+
+    let merged = merge(&output.stdout, &output.stderr);
+    if output.status.success() != allowed {
+        return Err(format!(
+            "unix supervisor connect allowed={allowed} status={:?}; output={}",
+            output.status,
+            merged.trim()
+        ));
+    }
+    case.check_status(output.status.code().unwrap_or(-1), &merged)
 }
 
 #[cfg(target_os = "linux")]

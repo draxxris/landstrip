@@ -6,18 +6,13 @@ use super::grant::{Grant, SocketGrant};
 use super::notify::NotificationResult;
 use super::process::{MissingTarget, TargetProcess};
 use super::supervise::{Denial, Denials};
-use crate::paths::PathCoverage;
-use crate::policy::{AccessPolicy, UnixSocketAccess};
+use crate::policy::{AccessPolicy, UnixPathAccess, UnixSocketAccess};
 use crate::trap::NetworkOperation;
-use nix::sys::stat::fstat;
-use std::env;
 use std::ffi::OsStr;
-use std::fs;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub(super) type SocketAddrCall =
@@ -489,45 +484,10 @@ fn authorize_unix_path(
     target: &Path,
     object: Option<BorrowedFd<'_>>,
 ) -> SysResult<()> {
-    if is_supervisor_socket(target, object) {
-        return Err(BrokerError::PolicyDenied);
+    match policy.unix_path_access(target, object) {
+        UnixPathAccess::Allowed => Ok(()),
+        UnixPathAccess::Denied => Err(BrokerError::PolicyDenied),
     }
-    match policy.network_access.unix_socket_access() {
-        UnixSocketAccess::Unrestricted => Ok(()),
-        UnixSocketAccess::AllowPaths(paths) => target
-            .is_under_any(paths)
-            .then_some(())
-            .ok_or(BrokerError::PolicyDenied),
-        UnixSocketAccess::Denied => Err(BrokerError::PolicyDenied),
-    }
-}
-
-fn is_supervisor_socket(target: &Path, object: Option<BorrowedFd<'_>>) -> bool {
-    // SAFETY: getuid(2) is always defined and has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    let uid_runtime = Path::new("/run/user").join(uid.to_string());
-    let runtime = env::var_os("XDG_RUNTIME_DIR").map_or_else(|| uid_runtime.clone(), PathBuf::from);
-    let candidates = [
-        runtime.join("bus"),
-        uid_runtime.join("bus"),
-        PathBuf::from("/run/dbus/system_bus_socket"),
-    ];
-    candidates
-        .iter()
-        .any(|socket| target == socket || object.is_some_and(|fd| same_socket_inode(fd, socket)))
-        || target.is_under("/run/systemd")
-        || target.is_under(runtime.join("systemd"))
-        || target.is_under(uid_runtime.join("systemd"))
-}
-
-fn same_socket_inode(left: BorrowedFd<'_>, right: &Path) -> bool {
-    let Ok(stat) = fstat(left) else {
-        return true;
-    };
-    let Ok(right) = fs::metadata(right) else {
-        return false;
-    };
-    stat.st_dev == right.dev() && stat.st_ino == right.ino()
 }
 
 fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {

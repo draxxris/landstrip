@@ -24,12 +24,22 @@ use crate::paths::{
     normalize_path_lexically,
 };
 use anyhow::Result;
+#[cfg(target_os = "linux")]
+use nix::sys::stat::fstat;
 use serde::Serialize;
 use std::env;
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize)]
@@ -50,6 +60,8 @@ pub(crate) struct AccessPolicy {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
+    #[cfg(target_os = "linux")]
+    pub(crate) supervisor_sockets: SupervisorSocketSet,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) macos: SandboxDarwin,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -413,6 +425,118 @@ impl UnixSocketAccess {
     }
 }
 
+/// Decision for a Unix socket `connect` or `bind` target.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum UnixPathAccess {
+    Allowed,
+    Denied,
+}
+
+/// Sockets a sandboxed child could use to ask an unsandboxed service manager to
+/// start a process that inherits neither Landlock nor seccomp.
+///
+/// The defaults are discovered from `DBUS_SYSTEM_BUS_ADDRESS`,
+/// `DBUS_SESSION_BUS_ADDRESS`, and `XDG_RUNTIME_DIR`; `network.supervisorSockets`
+/// replaces them.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct SupervisorSocketSet(Vec<PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl SupervisorSocketSet {
+    /// `None` selects the discovered defaults. An explicit list replaces them,
+    /// so a policy naming its own service manager is not also restricted by the
+    /// sockets this host happens to have.
+    pub(crate) fn new(overrides: Option<Vec<PathBuf>>) -> Self {
+        let mut paths = match overrides {
+            Some(paths) => paths,
+            None => Self::discovered(),
+        };
+        paths.normalize_roots();
+        Self(paths)
+    }
+
+    /// Each entry covers the path and, for a directory, its subtree. The inode
+    /// comparison keeps a symlink or hard link from naming a denied socket.
+    pub(crate) fn contains(&self, target: &Path, object: Option<BorrowedFd<'_>>) -> bool {
+        self.0.iter().any(|candidate| {
+            target.is_under(candidate) || object.is_some_and(|fd| Self::same_inode(fd, candidate))
+        })
+    }
+
+    fn discovered() -> Vec<PathBuf> {
+        // SAFETY: getuid(2) is always defined and has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let uid_runtime = Path::new("/run/user").join(uid.to_string());
+        let runtime =
+            env::var_os("XDG_RUNTIME_DIR").map_or_else(|| uid_runtime.clone(), PathBuf::from);
+        let mut paths = vec![
+            PathBuf::from("/run/dbus/system_bus_socket"),
+            runtime.join("bus"),
+            uid_runtime.join("bus"),
+            PathBuf::from("/run/systemd"),
+            runtime.join("systemd"),
+            uid_runtime.join("systemd"),
+        ];
+        paths.extend(
+            ["DBUS_SYSTEM_BUS_ADDRESS", "DBUS_SESSION_BUS_ADDRESS"]
+                .into_iter()
+                .filter_map(env::var_os)
+                .filter_map(|addresses| Self::bus_path(&addresses)),
+        );
+        paths
+    }
+
+    /// First pathname in a D-Bus server address list.
+    fn bus_path(addresses: &OsStr) -> Option<PathBuf> {
+        addresses
+            .as_bytes()
+            .split(|byte| *byte == b';')
+            .filter_map(|entry| entry.strip_prefix(b"unix:"))
+            .find_map(|params| {
+                params
+                    .split(|byte| *byte == b',')
+                    .find_map(|param| param.strip_prefix(b"path="))
+            })
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+    }
+
+    fn same_inode(left: BorrowedFd<'_>, right: &Path) -> bool {
+        let Ok(stat) = fstat(left) else {
+            return true;
+        };
+        let Ok(right) = fs::metadata(right) else {
+            return false;
+        };
+        stat.st_dev == right.dev() && stat.st_ino == right.ino()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AccessPolicy {
+    /// A service manager socket stays denied whatever the unix socket policy
+    /// says: approving one would start a process outside Landlock and seccomp,
+    /// which no later rule can undo.
+    pub(crate) fn unix_path_access(
+        &self,
+        target: &Path,
+        object: Option<BorrowedFd<'_>>,
+    ) -> UnixPathAccess {
+        if self.supervisor_sockets.contains(target, object) {
+            return UnixPathAccess::Denied;
+        }
+        match self.network_access.unix_socket_access() {
+            UnixSocketAccess::Unrestricted => UnixPathAccess::Allowed,
+            UnixSocketAccess::AllowPaths(paths) if target.is_under_any(paths) => {
+                UnixPathAccess::Allowed
+            }
+            UnixSocketAccess::AllowPaths(_) | UnixSocketAccess::Denied => UnixPathAccess::Denied,
+        }
+    }
+}
+
 impl Settings {
     pub(crate) fn resolve(&self, policy_base: &Path) -> Result<AccessPolicy> {
         let filesystem = &self.filesystem;
@@ -511,6 +635,9 @@ impl Settings {
             read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
             read_symlinks,
             network_access: resolver.lower_network_policy(network)?,
+            #[cfg(target_os = "linux")]
+            supervisor_sockets: resolver
+                .resolve_supervisor_sockets(network.supervisor_sockets.as_deref())?,
             macos: self.macos.normalize()?,
             app_container_mode: windows.app_container_mode,
             allow_windows_loopback: windows.allow_loopback,
@@ -777,6 +904,18 @@ impl PolicyResolver {
         };
 
         Ok(normalize_path_lexically(&resolved))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve_supervisor_sockets(
+        &self,
+        overrides: Option<&[PathSelector]>,
+    ) -> Result<SupervisorSocketSet> {
+        let resolved = match overrides {
+            Some(paths) => Some(self.resolve_paths(paths)?),
+            None => None,
+        };
+        Ok(SupervisorSocketSet::new(resolved))
     }
 
     fn resolve_paths(&self, paths: &[PathSelector]) -> Result<Vec<PathBuf>> {
